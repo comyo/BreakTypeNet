@@ -53,26 +53,11 @@ python smoke_test.py
 
 The VWBT-9000 dataset is available from Figshare: https://doi.org/10.6084/m9.figshare.28814993. Data and prepared tensors are not distributed with this repository.
 
-## Training
-
-Run the six-fold LOSO experiment with the online DINOv2 teacher:
-
-```bash
-python train_loso_breaktypenet.py \
-  --tensor-root /path/to/Tensors_uint8_temporal \
-  --test-site all \
-  --output-root results_loso_breaktypenet
-```
-
-Use `python train_loso_breaktypenet.py --help` for the available training options.
-
 ## Citation
 
 Please cite the VWBT-9000 dataset paper when using the data:
 
 > Yin, H., Cai, F., Qi, H., et al. (2025). A Video Dataset for Nearshore Wave Breaking Type Classification. *Scientific Data*, 12, 1722. https://doi.org/10.1038/s41597-025-06005-5
-
-The BreakTypeNet manuscript citation will be added after publication.
 
 ## License
 
