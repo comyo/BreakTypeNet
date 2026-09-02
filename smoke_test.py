@@ -10,8 +10,10 @@ def main() -> None:
     with torch.no_grad():
         logits, patch_features = model(torch.zeros(1, 1, 3, 224, 224))
     assert logits.shape == (1, 3)
-    assert patch_features.shape == (1, 256, 768)
-    print("BreakTypeNet smoke test passed")
+    assert patch_features.shape == (1, 256, 384)
+    parameters = sum(parameter.numel() for parameter in model.parameters())
+    assert parameters == 12_716_163
+    print(f"BreakTypeNet smoke test passed ({parameters / 1e6:.2f} M parameters)")
 
 
 if __name__ == "__main__":

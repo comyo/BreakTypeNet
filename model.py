@@ -6,150 +6,121 @@ import torch.nn.functional as F
 
 
 class LiteViT(nn.Module):
-    """Shared frame encoder and spatial classification branch."""
-    def __init__(self, img_size=224, patch_size=14, in_chans=3, embed_dim=768, depth=6, num_heads=12, 
-                 mlp_ratio=4., num_classes=3):
+    """Shared lightweight frame encoder."""
+
+    def __init__(
+        self,
+        img_size=224,
+        patch_size=14,
+        in_chans=3,
+        embed_dim=384,
+        depth=6,
+        num_heads=6,
+        mlp_ratio=4.0,
+    ):
         super().__init__()
-        self.patch_embed = nn.Conv2d(in_chans, embed_dim, kernel_size=patch_size, stride=patch_size)
+        self.patch_embed = nn.Conv2d(
+            in_chans, embed_dim, kernel_size=patch_size, stride=patch_size
+        )
+        num_patches = (img_size // patch_size) ** 2
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        # DINOv2 uses 14x14 patches for 224x224 images, resulting in 256 patches + 1 cls token = 257
-        self.pos_embed = nn.Parameter(torch.zeros(1, (img_size // patch_size) ** 2 + 1, embed_dim))
-        
-        # Transformer blocks
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.blocks = nn.ModuleList([
             nn.TransformerEncoderLayer(
                 d_model=embed_dim,
                 nhead=num_heads,
                 dim_feedforward=int(embed_dim * mlp_ratio),
                 dropout=0.1,
-                batch_first=True
-            ) for _ in range(depth)
+                batch_first=True,
+            )
+            for _ in range(depth)
         ])
-        
         self.norm = nn.LayerNorm(embed_dim)
-        self.head = nn.Linear(embed_dim, num_classes)
-        
-        # Initialize weights
+
         nn.init.trunc_normal_(self.pos_embed, std=0.02)
         nn.init.trunc_normal_(self.cls_token, std=0.02)
         self.apply(self._init_weights)
-        
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.trunc_normal_(m.weight, std=0.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-            
-    def forward_features(self, x):
-        # Patch embedding
-        x = self.patch_embed(x)  # B, C, H, W -> B, embed_dim, H//patch_size, W//patch_size
-        x = x.flatten(2).transpose(1, 2)  # B, embed_dim, N -> B, N, embed_dim
-        
-        # Add cls token and positional embedding
-        cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        x = x + self.pos_embed
-        
-        # Apply transformer blocks
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            nn.init.trunc_normal_(module.weight, std=0.02)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0)
+        elif isinstance(module, nn.LayerNorm):
+            nn.init.constant_(module.bias, 0)
+            nn.init.constant_(module.weight, 1.0)
+
+    def forward(self, frames):
+        tokens = self.patch_embed(frames).flatten(2).transpose(1, 2)
+        cls_tokens = self.cls_token.expand(tokens.shape[0], -1, -1)
+        tokens = torch.cat((cls_tokens, tokens), dim=1) + self.pos_embed
         for block in self.blocks:
-            x = block(x)
-            
-        x = self.norm(x)
-        return x  # Return all tokens including cls token
-    
-    def forward(self, x):
-        x = self.forward_features(x)
-        # Use cls token for classification
-        cls_token = x[:, 0]
-        return self.head(cls_token), x[:, 1:]  # Return classification and patch tokens
+            tokens = block(tokens)
+        return self.norm(tokens)[:, 1:]
 
 
 class LSTMClassifier(nn.Module):
-    """Three-layer unidirectional LSTM temporal classification branch."""
+    """Three-layer unidirectional temporal classifier."""
 
-    def __init__(self, CNN_embed_dim=768, h_RNN_layers=3, h_RNN=256, h_FC_dim=128, drop_p=0.3, num_classes=3):
+    def __init__(
+        self,
+        input_dim=384,
+        hidden_dim=256,
+        layers=3,
+        fc_dim=128,
+        dropout=0.3,
+        num_classes=3,
+    ):
         super().__init__()
-        self.LSTM = nn.LSTM(input_size=CNN_embed_dim,
-                            hidden_size=h_RNN,
-                            num_layers=h_RNN_layers,
-                            batch_first=True)
-        self.fc1 = nn.Linear(h_RNN, h_FC_dim)
-        self.fc2 = nn.Linear(h_FC_dim, num_classes)
-        self.drop_p = drop_p
+        self.lstm = nn.LSTM(
+            input_size=input_dim,
+            hidden_size=hidden_dim,
+            num_layers=layers,
+            batch_first=True,
+        )
+        self.fc1 = nn.Linear(hidden_dim, fc_dim)
+        self.fc2 = nn.Linear(fc_dim, num_classes)
+        self.dropout = dropout
 
-    def forward(self, x_RNN):
-        self.LSTM.flatten_parameters()
-        RNN_out, _ = self.LSTM(x_RNN, None)
-        x = self.fc1(RNN_out[:, -1, :])
-        x = F.relu(x)
-        x = F.dropout(x, p=self.drop_p, training=self.training)
-        x = self.fc2(x)
-        return x
+    def forward(self, frame_features):
+        self.lstm.flatten_parameters()
+        sequence, _ = self.lstm(frame_features)
+        output = F.relu(self.fc1(sequence[:, -1]))
+        output = F.dropout(output, p=self.dropout, training=self.training)
+        return self.fc2(output)
 
 
 class FeatureAdapter(nn.Module):
-    """Adapter to map student features to teacher feature space"""
-    def __init__(self, student_dim, teacher_dim):
+    """Map 384-dimensional student patches to the 768-dimensional teacher space."""
+
+    def __init__(self, student_dim=384, teacher_dim=768):
         super().__init__()
         self.adapter = nn.Linear(student_dim, teacher_dim)
-        
-    def forward(self, x):
-        return self.adapter(x)
+
+    def forward(self, features):
+        return self.adapter(features)
 
 
 class BreakTypeNet(nn.Module):
-    """Video classifier combining frame-wise spatial and LSTM temporal logits."""
+    """LiteViT frame encoding followed by LSTM video classification."""
 
-    def __init__(self, num_classes=3, sequence_length=60, embed_dim=768):
+    def __init__(self, num_classes=3, embed_dim=384):
         super().__init__()
-        self.vit = LiteViT(num_classes=num_classes, embed_dim=embed_dim)
-        self.lstm = LSTMClassifier(CNN_embed_dim=embed_dim, num_classes=num_classes)
-        self.sequence_length = sequence_length
-        self.embed_dim = embed_dim
-        
-    def forward(self, x):
-        """
-        Forward pass for sequence of images
-        Args:
-            x: Tensor of shape (batch_size, sequence_length, channels, height, width)
-        Returns:
-            combined_output: Classification logits
-            sequence_features: Features for each frame in the sequence
-        """
-        batch_size, seq_len, channels, height, width = x.shape
-        
-        # Reshape to process all frames at once: (batch_size * seq_len, channels, height, width)
-        x_flat = x.view(batch_size * seq_len, channels, height, width)
-        
-        # Get ViT features for all frames
-        cls_outputs, patch_features = self.vit(x_flat)
-        
-        # Reshape back to sequence format
-        # cls_outputs: (batch_size * seq_len, num_classes) -> (batch_size, seq_len, num_classes)
-        cls_outputs = cls_outputs.view(batch_size, seq_len, -1)
-        
-        # patch_features: (batch_size * seq_len, num_patches, feature_dim) -> (batch_size, seq_len, num_patches, feature_dim)
-        num_patches, feature_dim = patch_features.shape[1], patch_features.shape[2]
-        patch_features = patch_features.view(batch_size, seq_len, num_patches, feature_dim)
-        
-        # For LSTM, we'll use the average of patch features for each frame
-        # This gives us a sequence of frame-level features
-        frame_features = torch.mean(patch_features, dim=2)  # (batch_size, seq_len, feature_dim)
-        
-        # Process frame sequence with LSTM
-        lstm_output = self.lstm(frame_features)
-        
-        # Average the ViT classification outputs across the sequence
-        avg_cls_output = torch.mean(cls_outputs, dim=1)
-        
-        # Fuse video-level spatial and temporal logits before softmax.
-        combined_output = avg_cls_output + lstm_output
-        
-        # Return features in the format expected by the loss function
-        # We'll return the mean patch features across the sequence for distillation
-        sequence_features = torch.mean(patch_features, dim=1)  # (batch_size, num_patches, feature_dim)
-        
-        return combined_output, sequence_features
+        self.vit = LiteViT(embed_dim=embed_dim)
+        self.lstm = LSTMClassifier(input_dim=embed_dim, num_classes=num_classes)
+
+    def forward(self, videos):
+        batch_size, sequence_length, channels, height, width = videos.shape
+        frames = videos.reshape(
+            batch_size * sequence_length, channels, height, width
+        )
+        patches = self.vit(frames)
+        num_patches, feature_dim = patches.shape[1:]
+        patches = patches.reshape(
+            batch_size, sequence_length, num_patches, feature_dim
+        )
+        frame_features = patches.mean(dim=2)
+        logits = self.lstm(frame_features)
+        distillation_features = patches.mean(dim=1)
+        return logits, distillation_features

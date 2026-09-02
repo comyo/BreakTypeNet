@@ -1,6 +1,6 @@
 # BreakTypeNet
 
-BreakTypeNet is a video classifier for recognizing three nearshore wave breaking types: **Spilling**, **Plunging**, and **Surging**. It combines a shared LiteViT frame encoder, an LSTM temporal branch, and training-stage knowledge distillation from a frozen DINOv2 ViT-B/14 teacher.
+BreakTypeNet is a video classifier for recognizing three nearshore wave breaking types: **Spilling**, **Plunging**, and **Surging**. It combines a shared LiteViT frame encoder, LSTM temporal modeling, and training-stage knowledge distillation from a frozen DINOv2 ViT-B/14 teacher.
 
 This repository contains the model and the deterministic six-fold leave-one-site-out (LOSO) training pipeline. Data, model weights, and experiment outputs are not included.
 
@@ -8,11 +8,9 @@ This repository contains the model and the deterministic six-fold leave-one-site
 
 Each input is a 30 s clip represented by 60 RGB frames at 224 x 224 pixels.
 
-- **LiteViT:** 14 x 14 patches, 768-dimensional embeddings, six Transformer blocks, and 12 attention heads.
-- **Spatial branch:** the `[CLS]` token from each frame is classified, and the frame-wise logits are averaged over time.
-- **Temporal branch:** patch tokens are spatially averaged into frame-level vectors and passed to a three-layer unidirectional LSTM with a hidden size of 256.
-- **Fusion:** the video-level spatial logits and LSTM temporal logits are added before Softmax.
-- **Knowledge distillation:** a frozen DINOv2 ViT-B/14 teacher provides temporally averaged patch features for feature imitation and patch-relation losses. The teacher and feature adapter are removed at inference.
+- **LiteViT:** 14 x 14 patches, 384-dimensional embeddings, six Transformer blocks, and six attention heads.
+- **Temporal modeling:** patch tokens are spatially averaged into frame-level vectors and passed to a three-layer unidirectional LSTM with a hidden size of 256. The final hidden state is used for video classification.
+- **Knowledge distillation:** a frozen DINOv2 ViT-B/14 teacher provides temporally averaged patch features for feature imitation and patch-relation losses. A training-only adapter maps student features from 384 to 768 dimensions; the teacher and adapter are removed at inference.
 
 The training objective uses equal weights for task supervision, feature imitation, and relational distillation (`alpha = beta = gamma = 1.0`). It does not use teacher logits, temperature-based distillation, KL divergence, or GroupDRO.
 
@@ -51,7 +49,7 @@ python smoke_test.py
 
 ## Data
 
-The VWBT-9000 dataset is available from Figshare: https://doi.org/10.6084/m9.figshare.28814993. Data and prepared tensors are not distributed with this repository.
+The VWBT-9000 dataset is available from Figshare: https://doi.org/10.6084/m9.figshare.28814993. The loader expects 60 ordered JPG frames per clip under `image_root/Class/Clip/`, where each clip directory follows `{Class}-{Index}-{Camera_ID}-{YYYYMMDDhhmmssZ}`. Data are not distributed with this repository.
 
 ## Citation
 

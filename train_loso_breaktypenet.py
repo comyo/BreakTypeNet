@@ -18,6 +18,7 @@ from typing import Iterable
 import numpy as np
 import torch
 import torch.nn.functional as F
+from PIL import Image
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, recall_score
 from torch import nn, optim
 from torch.amp import GradScaler, autocast
@@ -49,8 +50,8 @@ CAMERA_TO_SITE = {
     "Camera_12": "SiteF", "Camera_13": "SiteF",
     "Camera_14": "SiteF", "Camera_15": "SiteF",
 }
-FILENAME_RE = re.compile(
-    r"^(Spilling|Plunging|Surging)-([0-9]+)-(Camera_[0-9]{2})-([0-9]{14}Z)[.]pt$"
+CLIP_NAME_RE = re.compile(
+    r"^(Spilling|Plunging|Surging)-([0-9]+)-(Camera_[0-9]{2})-([0-9]{14}Z)$"
 )
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
 IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
@@ -72,10 +73,10 @@ def parse_args() -> argparse.Namespace:
         description="Six-fold leave-one-site-out training for BreakTypeNet."
     )
     parser.add_argument(
-        "--tensor-root",
+        "--image-root",
         type=Path,
         required=True,
-        help="Directory containing the 9,000 uint8 video tensors.",
+        help="Dataset root containing class/clip directories of JPG frames.",
     )
     parser.add_argument(
         "--output-root",
@@ -193,35 +194,49 @@ def seed_worker(worker_id: int) -> None:
     random.seed(worker_seed)
 
 
-def scan_samples(tensor_root: Path) -> list[Sample]:
-    if not tensor_root.is_dir():
-        raise FileNotFoundError(f"Tensor root does not exist: {tensor_root}")
+def clip_frames(path: Path) -> list[Path]:
+    return sorted(
+        frame for frame in path.iterdir()
+        if frame.is_file() and frame.suffix.lower() in {".jpg", ".jpeg"}
+    )
+
+
+def scan_samples(image_root: Path) -> list[Sample]:
+    if not image_root.is_dir():
+        raise FileNotFoundError(f"Image root does not exist: {image_root}")
     samples = []
     rejected = []
-    for path in tensor_root.glob("*.pt"):
-        match = FILENAME_RE.match(path.name)
-        if not match:
-            rejected.append(path.name)
-            continue
-        label_name, _, camera, timestamp_text = match.groups()
-        if camera not in CAMERA_TO_SITE:
-            rejected.append(path.name)
-            continue
-        site = CAMERA_TO_SITE[camera]
-        samples.append(Sample(
-            path=path.resolve(),
-            label_name=label_name,
-            label_id=CLASS_TO_ID[label_name],
-            camera=camera,
-            site=site,
-            station=SITE_TO_STATION[site],
-            timestamp=datetime.strptime(timestamp_text, "%Y%m%d%H%M%SZ"),
-        ))
+    for class_name in CLASS_TO_ID:
+        class_dir = image_root / class_name
+        if not class_dir.is_dir():
+            raise FileNotFoundError(f"Missing class directory: {class_dir}")
+        for path in sorted(item for item in class_dir.iterdir() if item.is_dir()):
+            match = CLIP_NAME_RE.match(path.name)
+            if not match or match.group(1) != class_name:
+                rejected.append(str(path.relative_to(image_root)))
+                continue
+            label_name, _, camera, timestamp_text = match.groups()
+            frames = clip_frames(path)
+            if camera not in CAMERA_TO_SITE or len(frames) != 60:
+                rejected.append(
+                    f"{path.relative_to(image_root)} ({len(frames)} JPG frames)"
+                )
+                continue
+            site = CAMERA_TO_SITE[camera]
+            samples.append(Sample(
+                path=path.resolve(),
+                label_name=label_name,
+                label_id=CLASS_TO_ID[label_name],
+                camera=camera,
+                site=site,
+                station=SITE_TO_STATION[site],
+                timestamp=datetime.strptime(timestamp_text, "%Y%m%d%H%M%SZ"),
+            ))
     if rejected:
         preview = ", ".join(rejected[:5])
-        raise ValueError(f"Rejected {len(rejected)} tensor filenames; examples: {preview}")
+        raise ValueError(f"Rejected {len(rejected)} clip directories; examples: {preview}")
     if len(samples) != 9000:
-        raise ValueError(f"Expected 9,000 tensors, found {len(samples)} in {tensor_root}")
+        raise ValueError(f"Expected 9,000 clips, found {len(samples)} in {image_root}")
     samples.sort(key=lambda item: (item.site, item.label_id, item.timestamp, item.path.name))
     return samples
 
@@ -271,7 +286,7 @@ def save_manifest(path: Path, split_name: str, samples: Iterable[Sample]) -> Non
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=[
             "split", "site", "station", "camera", "true_name", "y_true",
-            "timestamp_utc", "pt_path",
+            "timestamp_utc", "clip_path",
         ])
         writer.writeheader()
         for sample in samples:
@@ -283,34 +298,11 @@ def save_manifest(path: Path, split_name: str, samples: Iterable[Sample]) -> Non
                 "true_name": sample.label_name,
                 "y_true": sample.label_id,
                 "timestamp_utc": sample.timestamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "pt_path": str(sample.path),
+                "clip_path": str(sample.path),
             })
 
 
-def extract_tensor(payload: object, path: Path) -> torch.Tensor:
-    if torch.is_tensor(payload):
-        tensor = payload
-    elif isinstance(payload, dict):
-        tensors = [value for value in payload.values() if torch.is_tensor(value)]
-        if len(tensors) != 1:
-            raise ValueError(f"Expected one tensor in dict payload: {path}")
-        tensor = tensors[0]
-    else:
-        raise TypeError(f"Unsupported tensor payload {type(payload)!r}: {path}")
-    if tensor.ndim != 4:
-        raise ValueError(f"Expected a four-dimensional video tensor, got {tensor.shape}: {path}")
-    if tensor.shape[1] == 3:
-        video = tensor
-    elif tensor.shape[-1] == 3:
-        video = tensor.permute(0, 3, 1, 2)
-    else:
-        raise ValueError(f"Cannot locate RGB channel dimension in {tensor.shape}: {path}")
-    if video.shape != (60, 3, 224, 224):
-        raise ValueError(f"Expected [60,3,224,224], got {tuple(video.shape)}: {path}")
-    return video
-
-
-class TensorVideoDataset(Dataset):
+class JPGVideoDataset(Dataset):
     def __init__(
         self,
         samples: list[Sample],
@@ -344,14 +336,18 @@ class TensorVideoDataset(Dataset):
 
     def __getitem__(self, index: int):
         sample = self.samples[index]
-        payload = torch.load(sample.path, map_location="cpu", weights_only=False)
-        video = extract_tensor(payload, sample.path)
-        if video.dtype == torch.uint8:
-            video = video.float().div_(255.0)
-        else:
-            video = video.float()
-            if float(video.max()) > 1.0:
-                video = video.div_(255.0)
+        frames = []
+        for frame_path in clip_frames(sample.path):
+            with Image.open(frame_path) as image:
+                frame = TF.pil_to_tensor(image.convert("RGB"))
+            frame = TF.resize(
+                frame, [224, 224], interpolation=InterpolationMode.BILINEAR,
+                antialias=True,
+            )
+            frames.append(frame)
+        if len(frames) != 60:
+            raise ValueError(f"Expected 60 JPG frames: {sample.path}")
+        video = torch.stack(frames).float().div_(255.0)
         if self.augment:
             video = self._augment(video)
         video = (video - IMAGENET_MEAN) / IMAGENET_STD
@@ -366,7 +362,7 @@ def make_loader(
 ) -> DataLoader:
     generator = torch.Generator().manual_seed(args.seed + seed_offset)
     return DataLoader(
-        TensorVideoDataset(
+        JPGVideoDataset(
             samples,
             training=training,
             augment=training and not args.no_augmentation,
@@ -472,7 +468,7 @@ def evaluate(
                     "site": sample.site,
                     "station": sample.station,
                     "camera": sample.camera,
-                    "pt_path": str(sample.path),
+                    "clip_path": str(sample.path),
                     "true_name": sample.label_name,
                     "y_true": label,
                     "pred_name": ID_TO_CLASS[prediction],
@@ -511,8 +507,8 @@ def train_one_fold(
     val_loader = make_loader(val_samples, False, args, seed_offset=22)
     test_loader = make_loader(test_samples, False, args, seed_offset=33)
 
-    student = BreakTypeNet(num_classes=3, sequence_length=60, embed_dim=768).to(device)
-    adapter = FeatureAdapter(768, 768).to(device)
+    student = BreakTypeNet(num_classes=3, embed_dim=384).to(device)
+    adapter = FeatureAdapter(384, 768).to(device)
     criterion = HeterogeneousKnowledgeDistillationLoss(
         alpha=1.0, beta=1.0, gamma=1.0
     )
@@ -527,7 +523,7 @@ def train_one_fold(
 
     config = vars(args).copy()
     config.update({
-        "tensor_root": str(args.tensor_root.resolve()),
+        "image_root": str(args.image_root.resolve()),
         "output_root": str(args.output_root.resolve()),
         "dinov2_repo": str(args.dinov2_repo.resolve()) if args.dinov2_repo else None,
         "teacher_protocol": "online_same_frames_as_student",
@@ -764,7 +760,7 @@ def train_one_fold(
 
 
 def print_split_summary(samples: list[Sample]) -> None:
-    print(f"Validated {len(samples):,} tensors")
+    print(f"Validated {len(samples):,} JPG clips")
     for test_site in SITE_TO_STATION:
         train, val, test = make_loso_split(samples, test_site)
         print(
@@ -808,7 +804,7 @@ def main() -> None:
     if min(args.batch_size, args.accumulation_steps, args.epochs, args.patience) <= 0:
         raise ValueError("Batch size, accumulation, epochs, and patience must be positive")
     set_seed(args.seed)
-    samples = scan_samples(args.tensor_root)
+    samples = scan_samples(args.image_root)
     print_split_summary(samples)
     if args.dry_run:
         return
