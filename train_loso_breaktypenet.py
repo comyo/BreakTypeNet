@@ -76,7 +76,7 @@ def parse_args() -> argparse.Namespace:
         "--image-root",
         type=Path,
         required=True,
-        help="Dataset root containing class/clip directories of JPG frames.",
+        help="Dataset root containing one JPG-frame directory per clip.",
     )
     parser.add_argument(
         "--output-root",
@@ -206,32 +206,26 @@ def scan_samples(image_root: Path) -> list[Sample]:
         raise FileNotFoundError(f"Image root does not exist: {image_root}")
     samples = []
     rejected = []
-    for class_name in CLASS_TO_ID:
-        class_dir = image_root / class_name
-        if not class_dir.is_dir():
-            raise FileNotFoundError(f"Missing class directory: {class_dir}")
-        for path in sorted(item for item in class_dir.iterdir() if item.is_dir()):
-            match = CLIP_NAME_RE.match(path.name)
-            if not match or match.group(1) != class_name:
-                rejected.append(str(path.relative_to(image_root)))
-                continue
-            label_name, _, camera, timestamp_text = match.groups()
-            frames = clip_frames(path)
-            if camera not in CAMERA_TO_SITE or len(frames) != 60:
-                rejected.append(
-                    f"{path.relative_to(image_root)} ({len(frames)} JPG frames)"
-                )
-                continue
-            site = CAMERA_TO_SITE[camera]
-            samples.append(Sample(
-                path=path.resolve(),
-                label_name=label_name,
-                label_id=CLASS_TO_ID[label_name],
-                camera=camera,
-                site=site,
-                station=SITE_TO_STATION[site],
-                timestamp=datetime.strptime(timestamp_text, "%Y%m%d%H%M%SZ"),
-            ))
+    for path in sorted(item for item in image_root.iterdir() if item.is_dir()):
+        match = CLIP_NAME_RE.match(path.name)
+        if not match:
+            rejected.append(path.name)
+            continue
+        label_name, _, camera, timestamp_text = match.groups()
+        frames = clip_frames(path)
+        if camera not in CAMERA_TO_SITE or len(frames) < 60:
+            rejected.append(f"{path.name} ({len(frames)} JPG frames)")
+            continue
+        site = CAMERA_TO_SITE[camera]
+        samples.append(Sample(
+            path=path.resolve(),
+            label_name=label_name,
+            label_id=CLASS_TO_ID[label_name],
+            camera=camera,
+            site=site,
+            station=SITE_TO_STATION[site],
+            timestamp=datetime.strptime(timestamp_text, "%Y%m%d%H%M%SZ"),
+        ))
     if rejected:
         preview = ", ".join(rejected[:5])
         raise ValueError(f"Rejected {len(rejected)} clip directories; examples: {preview}")
@@ -337,7 +331,7 @@ class JPGVideoDataset(Dataset):
     def __getitem__(self, index: int):
         sample = self.samples[index]
         frames = []
-        for frame_path in clip_frames(sample.path):
+        for frame_path in clip_frames(sample.path)[:60]:
             with Image.open(frame_path) as image:
                 frame = TF.pil_to_tensor(image.convert("RGB"))
             frame = TF.resize(
@@ -346,7 +340,7 @@ class JPGVideoDataset(Dataset):
             )
             frames.append(frame)
         if len(frames) != 60:
-            raise ValueError(f"Expected 60 JPG frames: {sample.path}")
+            raise ValueError(f"Expected at least 60 JPG frames: {sample.path}")
         video = torch.stack(frames).float().div_(255.0)
         if self.augment:
             video = self._augment(video)

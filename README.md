@@ -49,7 +49,7 @@ python smoke_test.py
 
 ## Data
 
-The VWBT-9000 dataset is available from Figshare: https://doi.org/10.6084/m9.figshare.28814993. The loader expects 60 ordered JPG frames per clip under `image_root/Class/Clip/`, where each clip directory follows `{Class}-{Index}-{Camera_ID}-{YYYYMMDDhhmmssZ}`. Data are not distributed with this repository.
+The VWBT-9000 dataset is available from Figshare: https://doi.org/10.6084/m9.figshare.28814993. The loader uses the first 60 ordered JPG frames from each clip under `image_root/Clip/`, where each clip directory follows `{Class}-{Index}-{Camera_ID}-{YYYYMMDDhhmmssZ}`. Data are not distributed with this repository.
 
 ## Citation
 
