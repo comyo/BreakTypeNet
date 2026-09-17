@@ -59,4 +59,4 @@ Please cite the VWBT-9000 dataset paper when using the data:
 
 ## License
 
-The code in this repository is released under the MIT License. DINOv2 and the VWBT-9000 dataset are subject to their own licenses and terms of use.
+The contents of this repository are licensed under the [Creative Commons Attribution 4.0 International License (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/). DINOv2 and the VWBT-9000 dataset are subject to their own licenses and terms of use.
